@@ -9,9 +9,12 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <thread>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
@@ -59,6 +62,89 @@ std::uint64_t SessionSnapshotHostBytes(std::uint32_t token_count,
   return sizeof(SessionSnapshotHeader) + image_bytes +
          std::uint64_t{token_count} * sizeof(std::int32_t) +
          std::uint64_t{vocab_size} * sizeof(float);
+}
+
+/// Recycled snapshot payload buffers.
+///
+/// Every capture used to fault in a fresh mapping: even with parallel
+/// MADV_POPULATE_WRITE workers, populating ~1 GB before the device-to-host
+/// copy costs ~170 ms at a 33k-token context, paid on the synchronous
+/// frontier-freeze of every warm turn. Released buffers return here instead
+/// and are handed to the next capture fully populated. Every capture
+/// overwrites its whole buffer, so reuse never exposes stale bytes; the
+/// process boundary still separates clients. Retention of the pool is
+/// bounded by bytes, and the smallest buffer that fits is preferred so
+/// mixed snapshot sizes do not strand large buffers behind small ones.
+class SnapshotBufferPool final {
+public:
+  SnapshotBufferPool() = default;
+  ~SnapshotBufferPool() = default;
+  SnapshotBufferPool(const SnapshotBufferPool&) = delete;
+  SnapshotBufferPool& operator=(const SnapshotBufferPool&) = delete;
+  SnapshotBufferPool(SnapshotBufferPool&&) = delete;
+  SnapshotBufferPool& operator=(SnapshotBufferPool&&) = delete;
+
+  struct AcquiredBuffer {
+    std::unique_ptr<std::uint8_t[]> data;
+    std::uint64_t capacity{0};
+    bool populated{false};
+  };
+
+  [[nodiscard]] AcquiredBuffer Acquire(std::uint64_t size) {
+    AcquiredBuffer acquired;
+    acquired.capacity = size;
+    const std::lock_guard lock(mutex_);
+    std::size_t best = buffers_.size();
+    for (std::size_t i = 0; i < buffers_.size(); ++i) {
+      if (buffers_[i].second < size) {
+        continue;
+      }
+      if (best == buffers_.size() ||
+          buffers_[i].second < buffers_[best].second) {
+        best = i;
+      }
+    }
+    if (best != buffers_.size()) {
+      acquired.capacity = buffers_[best].second;
+      acquired.populated = true;
+      acquired.data = std::move(buffers_[best].first);
+      buffers_.erase(buffers_.begin() + static_cast<std::ptrdiff_t>(best));
+      return acquired;
+    }
+    acquired.data =
+        std::unique_ptr<std::uint8_t[]>(new std::uint8_t[size]);
+    return acquired;
+  }
+
+  void Release(std::unique_ptr<std::uint8_t[]> buffer,
+               std::uint64_t capacity) noexcept {
+    try {
+      const std::lock_guard lock(mutex_);
+      if (pooled_bytes_ + capacity > kMaxPooledBytes ||
+          buffers_.size() >= kMaxPooledBuffers) {
+        return;
+      }
+      pooled_bytes_ += capacity;
+      buffers_.emplace_back(std::move(buffer), capacity);
+    } catch (...) {
+      // Dropping a buffer only costs the next capture a fresh mapping.
+    }
+  }
+
+private:
+  // Enough for the concurrent captures of a busy multi-session host plus
+  // slack, without holding release-worthy memory against the host budget.
+  static constexpr std::size_t kMaxPooledBuffers = 8;
+  static constexpr std::uint64_t kMaxPooledBytes = std::uint64_t{4} << 30;
+  std::mutex mutex_;
+  std::vector<std::pair<std::unique_ptr<std::uint8_t[]>, std::uint64_t>>
+      buffers_;
+  std::uint64_t pooled_bytes_{0};
+};
+
+SnapshotBufferPool& SnapshotBuffers() noexcept {
+  static SnapshotBufferPool pool;
+  return pool;
 }
 
 }  // namespace
@@ -446,8 +532,15 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
   return true;
 }
 
-SessionSnapshot::SessionSnapshot(std::uint64_t size)
-    : data_(new std::uint8_t[size]), size_(size) {
+SessionSnapshot::SessionSnapshot(std::uint64_t size) : size_(size) {
+  auto acquired = SnapshotBuffers().Acquire(size);
+  data_ = std::move(acquired.data);
+  capacity_ = acquired.capacity;
+  if (acquired.populated) {
+    // A recycled buffer is faulted in and already huge-page advised; the
+    // capture overwrites every byte.
+    return;
+  }
   // Populate before asking for huge pages: first-touching an advised buffer
   // can synchronously compact fragmented UMA memory for seconds. Background
   // collapse may still promote the populated pages. Restrict both hints to
@@ -481,6 +574,12 @@ SessionSnapshot::SessionSnapshot(std::uint64_t size)
         (void)madvise(data_.get() + skip, length, MADV_HUGEPAGE);
       }
     }
+  }
+}
+
+SessionSnapshot::~SessionSnapshot() {
+  if (data_) {
+    SnapshotBuffers().Release(std::move(data_), capacity_);
   }
 }
 
