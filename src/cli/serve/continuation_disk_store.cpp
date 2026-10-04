@@ -318,11 +318,17 @@ struct ParsedImage {
   std::size_t payload_bytes{0};
 };
 
-ParseFailure ParseAndVerifyImage(std::vector<std::uint8_t>* image,
-                                 ParsedImage* parsed) {
-  if (image == nullptr || parsed == nullptr || image->size() < kHeaderBytes ||
+/// Structural header validation: magic, versions, size fields, the checksum
+/// field's format, and the compatibility identity and token vector it
+/// carries. expected_file_bytes decouples this from having read the payload:
+/// startup indexing passes the stat size, full-image reads pass image.size().
+/// No checksum of the image is computed here.
+ParseFailure ParseImageHeader(std::span<const std::uint8_t> image,
+                               std::size_t expected_file_bytes,
+                               ParsedImage* parsed) {
+  if (parsed == nullptr || image.size() < kHeaderBytes ||
       !std::equal(kMagic.begin(), kMagic.end(),
-                  image->begin() + kMagicOffset)) {
+                  image.begin() + kMagicOffset)) {
     return ParseFailure::kCorrupt;
   }
 
@@ -331,12 +337,11 @@ ParseFailure ParseAndVerifyImage(std::vector<std::uint8_t>* image,
   std::uint32_t identity_bytes_u32 = 0;
   std::uint32_t token_count_u32 = 0;
   std::uint64_t payload_bytes_u64 = 0;
-  const std::span<const std::uint8_t> readonly(*image);
-  if (!GetLittleEndian(readonly, kFileVersionOffset, &file_version) ||
-      !GetLittleEndian(readonly, kPayloadVersionOffset, &payload_version) ||
-      !GetLittleEndian(readonly, kIdentityBytesOffset, &identity_bytes_u32) ||
-      !GetLittleEndian(readonly, kTokenCountOffset, &token_count_u32) ||
-      !GetLittleEndian(readonly, kPayloadBytesOffset, &payload_bytes_u64) ||
+  if (!GetLittleEndian(image, kFileVersionOffset, &file_version) ||
+      !GetLittleEndian(image, kPayloadVersionOffset, &payload_version) ||
+      !GetLittleEndian(image, kIdentityBytesOffset, &identity_bytes_u32) ||
+      !GetLittleEndian(image, kTokenCountOffset, &token_count_u32) ||
+      !GetLittleEndian(image, kPayloadBytesOffset, &payload_bytes_u64) ||
       file_version != kFileVersion || payload_version == 0 ||
       identity_bytes_u32 == 0 || identity_bytes_u32 > kMaxIdentityBytes ||
       token_count_u32 == 0 || token_count_u32 > kMaxTokenCount ||
@@ -356,32 +361,25 @@ ParseFailure ParseAndVerifyImage(std::vector<std::uint8_t>* image,
   } catch (...) {
     return ParseFailure::kCorrupt;
   }
-  if (expected_bytes != image->size()) {
+  if (expected_bytes != expected_file_bytes) {
     return ParseFailure::kCorrupt;
   }
 
   const std::string stored_checksum(
-      reinterpret_cast<const char*>(image->data() + kChecksumOffset),
+      reinterpret_cast<const char*>(image.data() + kChecksumOffset),
       kChecksumBytes);
   if (!IsLowerHexDigest(stored_checksum)) {
     return ParseFailure::kCorrupt;
-  }
-  std::fill_n(image->begin() + kChecksumOffset, kChecksumBytes, 0);
-  const std::string computed_checksum = crypto::Sha256Hex(*image);
-  std::copy(stored_checksum.begin(), stored_checksum.end(),
-            image->begin() + kChecksumOffset);
-  if (computed_checksum != stored_checksum) {
-    return ParseFailure::kChecksum;
   }
 
   parsed->persistence.payload_version = payload_version;
   parsed->persistence.compatibility_identity.resize(identity_bytes);
   std::memcpy(parsed->persistence.compatibility_identity.data(),
-              image->data() + kHeaderBytes, identity_bytes);
+              image.data() + kHeaderBytes, identity_bytes);
   parsed->tokens.resize(token_count);
   std::size_t token_offset = kHeaderBytes + identity_bytes;
   for (TextRunnerToken& token : parsed->tokens) {
-    if (!GetLittleEndian(readonly, token_offset, &token)) {
+    if (!GetLittleEndian(image, token_offset, &token)) {
       return ParseFailure::kCorrupt;
     }
     token_offset += sizeof(std::uint32_t);
@@ -389,6 +387,41 @@ ParseFailure ParseAndVerifyImage(std::vector<std::uint8_t>* image,
   parsed->payload_offset = token_offset;
   parsed->payload_bytes = payload_bytes;
   return ParseFailure::kNone;
+}
+
+/// Whole-image SHA-256 verification against the stored digest. Leaves the
+/// image intact whether or not it matches.
+ParseFailure VerifyImageChecksum(std::span<std::uint8_t> image) {
+  if (image.size() < kHeaderBytes) {
+    return ParseFailure::kCorrupt;
+  }
+  const std::string stored_checksum(
+      reinterpret_cast<const char*>(image.data() + kChecksumOffset),
+      kChecksumBytes);
+  if (!IsLowerHexDigest(stored_checksum)) {
+    return ParseFailure::kCorrupt;
+  }
+  std::fill_n(image.begin() + kChecksumOffset, kChecksumBytes, 0);
+  const std::string computed_checksum = crypto::Sha256Hex(image);
+  std::copy(stored_checksum.begin(), stored_checksum.end(),
+            image.begin() + kChecksumOffset);
+  if (computed_checksum != stored_checksum) {
+    return ParseFailure::kChecksum;
+  }
+  return ParseFailure::kNone;
+}
+
+ParseFailure ParseAndVerifyImage(std::vector<std::uint8_t>* image,
+                                 ParsedImage* parsed) {
+  if (image == nullptr) {
+    return ParseFailure::kCorrupt;
+  }
+  const ParseFailure header =
+      ParseImageHeader(*image, image->size(), parsed);
+  if (header != ParseFailure::kNone) {
+    return header;
+  }
+  return VerifyImageChecksum(*image);
 }
 
 std::vector<std::uint8_t> BuildHeader(
@@ -802,6 +835,98 @@ struct ContinuationDiskStore::Impl {
     }
   }
 
+  /// Startup indexing reads only each file's header: the fixed prologue, then
+  /// the compatibility identity and token vector it sizes. Payload bytes stay
+  /// on disk until a restore verifies the whole-image checksum. The stat size
+  /// doubles as the structural end-to-end check the parser needs.
+  [[nodiscard]] bool ReadHeaderImage(
+      std::string_view filename, std::vector<std::uint8_t>* header,
+      std::size_t* file_bytes,
+      ContinuationDiskEventReason* failure_reason) const {
+    if (header == nullptr || failure_reason == nullptr) {
+      return false;
+    }
+    struct stat status{};
+    if (!SafeRegularFile(filename, &status)) {
+      *failure_reason = ContinuationDiskEventReason::kUnsafeFile;
+      return false;
+    }
+    if (file_bytes != nullptr && status.st_size > 0) {
+      *file_bytes = static_cast<std::size_t>(status.st_size);
+    }
+    if (status.st_size <= 0 ||
+        static_cast<std::uint64_t>(status.st_size) <
+            static_cast<std::uint64_t>(kHeaderBytes)) {
+      *failure_reason = ContinuationDiskEventReason::kCorrupt;
+      return false;
+    }
+    const ScopedFileDescriptor file(
+        ::openat(directory_fd, std::string(filename).c_str(),
+                 O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+    if (!file) {
+      *failure_reason = ContinuationDiskEventReason::kIoFailure;
+      return false;
+    }
+    std::array<std::uint8_t, kHeaderBytes> prologue{};
+    if (!ReadAll(file.get(), std::span<std::uint8_t>(prologue))) {
+      *failure_reason = ContinuationDiskEventReason::kIoFailure;
+      return false;
+    }
+    if (!std::equal(kMagic.begin(), kMagic.end(),
+                    prologue.begin() + kMagicOffset)) {
+      *failure_reason = ContinuationDiskEventReason::kCorrupt;
+      return false;
+    }
+    std::uint32_t identity_bytes_u32 = 0;
+    std::uint32_t token_count_u32 = 0;
+    std::uint64_t payload_bytes_u64 = 0;
+    const std::span<const std::uint8_t> prologue_view(prologue);
+    std::uint32_t file_version = 0;
+    std::uint32_t payload_version = 0;
+    if (!GetLittleEndian(prologue_view, kFileVersionOffset, &file_version) ||
+        !GetLittleEndian(prologue_view, kPayloadVersionOffset,
+                         &payload_version) ||
+        !GetLittleEndian(prologue_view, kIdentityBytesOffset,
+                         &identity_bytes_u32) ||
+        !GetLittleEndian(prologue_view, kTokenCountOffset, &token_count_u32) ||
+        !GetLittleEndian(prologue_view, kPayloadBytesOffset,
+                         &payload_bytes_u64) ||
+        file_version != kFileVersion || payload_version == 0 ||
+        identity_bytes_u32 == 0 || identity_bytes_u32 > kMaxIdentityBytes ||
+        token_count_u32 == 0 || token_count_u32 > kMaxTokenCount ||
+        payload_bytes_u64 == 0 ||
+        payload_bytes_u64 >
+            static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+      *failure_reason = ContinuationDiskEventReason::kCorrupt;
+      return false;
+    }
+    std::size_t header_bytes = 0;
+    try {
+      header_bytes =
+          CheckedFileBytes(identity_bytes_u32, token_count_u32,
+                           static_cast<std::size_t>(payload_bytes_u64)) -
+          static_cast<std::size_t>(payload_bytes_u64);
+    } catch (...) {
+      *failure_reason = ContinuationDiskEventReason::kCorrupt;
+      return false;
+    }
+    if (header_bytes >
+        static_cast<std::size_t>(options.staging_capacity_bytes)) {
+      *failure_reason = ContinuationDiskEventReason::kStagingCapacity;
+      return false;
+    }
+    header->resize(header_bytes);
+    std::copy(prologue.begin(), prologue.end(), header->begin());
+    if (header_bytes > kHeaderBytes &&
+        !ReadAll(file.get(),
+                 std::span<std::uint8_t>(header->data() + kHeaderBytes,
+                                         header_bytes - kHeaderBytes))) {
+      *failure_reason = ContinuationDiskEventReason::kIoFailure;
+      return false;
+    }
+    return true;
+  }
+
   void IndexExistingFiles() {
     std::error_code error;
     const std::filesystem::directory_iterator iterator(
@@ -821,12 +946,14 @@ struct ContinuationDiskStore::Impl {
         continue;
       }
 
-      std::vector<std::uint8_t> image;
+      // Headers only: the payload stays unread until a restore verifies the
+      // whole-image checksum, so startup cost is per-file metadata instead
+      // of the retained tier's bytes.
+      std::vector<std::uint8_t> header;
       ContinuationDiskEventReason failure_reason =
           ContinuationDiskEventReason::kCorrupt;
-      ParsedImage parsed;
       std::size_t file_bytes = 0;
-      if (!ReadImage(filename, &image, &failure_reason, &file_bytes)) {
+      if (!ReadHeaderImage(filename, &header, &file_bytes, &failure_reason)) {
         if (failure_reason == ContinuationDiskEventReason::kStagingCapacity) {
           // A smaller RAM budget must not destroy a previously valid cache.
           // Account the file for LRU/retention, but never index unverified
@@ -852,14 +979,16 @@ struct ContinuationDiskStore::Impl {
         Emit(ContinuationDiskEventAction::kRemoved, failure_reason, 0, 0, 0);
         continue;
       }
-      const ParseFailure parse_failure = ParseAndVerifyImage(&image, &parsed);
+      ParsedImage parsed;
+      const ParseFailure parse_failure =
+          ParseImageHeader(header, file_bytes, &parsed);
       if (parse_failure != ParseFailure::kNone) {
         RemoveFileOnly(filename);
         Emit(ContinuationDiskEventAction::kRemoved,
              parse_failure == ParseFailure::kChecksum
                  ? ContinuationDiskEventReason::kChecksumMismatch
                  : ContinuationDiskEventReason::kCorrupt,
-             image.size(), 0, 0);
+             file_bytes, 0, 0);
         continue;
       }
 
@@ -876,7 +1005,7 @@ struct ContinuationDiskStore::Impl {
         if (duplicate->last_access >= last_access) {
           RemoveFileOnly(filename);
           Emit(ContinuationDiskEventAction::kRemoved,
-               ContinuationDiskEventReason::kExactReplacement, image.size(),
+               ContinuationDiskEventReason::kExactReplacement, file_bytes,
                parsed.payload_bytes, parsed.tokens.size());
           continue;
         }
@@ -887,7 +1016,7 @@ struct ContinuationDiskStore::Impl {
           .key_hash = digest,
           .persistence = std::move(parsed.persistence),
           .tokens = std::move(parsed.tokens),
-          .file_bytes = image.size(),
+          .file_bytes = file_bytes,
           .payload_bytes = parsed.payload_bytes,
           .last_access = last_access,
       });
