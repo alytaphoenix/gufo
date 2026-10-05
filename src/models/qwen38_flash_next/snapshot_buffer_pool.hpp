@@ -83,8 +83,12 @@ public:
           buffers_.size() >= limits_.max_buffers) {
         return;
       }
-      pooled_bytes_ += capacity;
+      // Charge only after the insertion succeeded: if vector growth throws,
+      // the buffer is dropped by the catch below and must not keep its byte
+      // allowance (a leaked charge on the static pool would persist for the
+      // process lifetime and eventually disable recycling).
       buffers_.emplace_back(std::move(buffer), capacity);
+      pooled_bytes_ += capacity;
     } catch (...) {
       // Dropping a buffer only costs the next capture a fresh mapping.
     }
