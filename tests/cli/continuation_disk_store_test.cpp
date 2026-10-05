@@ -461,7 +461,8 @@ void TestMinPrefixRestoresOnlyLongerCheckpoints() {
   std::vector<TextRunnerToken> prompt(7658);
   for (std::size_t i = 0; i < prompt.size(); ++i)
     prompt[i] = static_cast<TextRunnerToken>(i);
-  Expect(store.Save(runner, prompt.first(6144), *short_snapshot).stored,
+  Expect(store.Save(runner, std::span<const TextRunnerToken>(prompt).first(6144),
+                    *short_snapshot).stored,
          "short checkpoint stored");
   Expect(store.Save(runner, prompt, *long_snapshot).stored,
          "long checkpoint stored");
@@ -489,8 +490,10 @@ void TestMinPrefixRestoresOnlyLongerCheckpoints() {
   auto other_state = runner.CreateState();
   RequireFakeState(*other_state).value = 77;
   Expect(!store
-              .RestoreLongestPrefix(runner, *other_state, prompt.first(6144),
-                                    {}, 0, {}, 6144)
+              .RestoreLongestPrefix(
+                  runner, *other_state,
+                  std::span<const TextRunnerToken>(prompt).first(6144), {}, 0,
+                  {}, 6144)
               .restored,
          "short prompt: its own checkpoint is not longer than the hit");
   Expect(RequireFakeState(*other_state).value == 77,
