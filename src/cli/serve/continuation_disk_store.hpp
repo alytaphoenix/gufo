@@ -41,6 +41,9 @@ enum class ContinuationDiskEventReason : std::uint8_t {
   kSerializationFailure,
   kRestoreFailure,
   kBusy,
+  /// A stored prefix exists but does not extend past the caller's
+  /// already-cached prefix, so restoring it would be a regression (#411).
+  kNotLonger,
 };
 
 /// Sanitized disk-cache event. Prompt contents, token values, paths, model
@@ -156,12 +159,17 @@ public:
   /// Restores the longest exact saved prefix of prompt into state. When a
   /// stable boundary is supplied, a later checkpoint requires an earlier
   /// saved prefix too, so legacy full-prompt files cannot bypass migration.
+  /// When min_prefix_tokens is nonzero, the restore only happens when the
+  /// stored checkpoint extends past that count — a caller holding a shorter
+  /// RAM-cache hit consults the disk tier without regressing to it (#411).
+  /// Nothing is touched in the state when no restore happens.
   [[nodiscard]] RestoreResult RestoreLongestPrefix(
       const TextModelRunner& runner, TextRunnerState& state,
       std::span<const TextRunnerToken> prompt,
       std::span<const std::uint8_t> input_identity = {},
       std::size_t stable_prefix_tokens = 0,
-      std::span<const ContinuationInputPrefix> input_prefixes = {});
+      std::span<const ContinuationInputPrefix> input_prefixes = {},
+      std::size_t min_prefix_tokens = 0);
 
   /// Prefix lengths that prompt shares with stored entries but that no entry
   /// holds exactly.
