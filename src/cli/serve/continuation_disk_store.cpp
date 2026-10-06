@@ -1343,7 +1343,10 @@ struct ContinuationDiskStore::Impl {
         Emit(ContinuationDiskEventAction::kMiss,
              ContinuationDiskEventReason::kRestoreFailure, file_bytes,
              payload_bytes, token_count);
-        return {};
+        // The restore mutated state before failing and the artifact is gone.
+        // Say so: a caller holding a shorter RAM hit must not keep reusing
+        // its metrics against this invalidated state.
+        return {.state_invalidated = true};
       }
 
       TouchEntry(candidate);

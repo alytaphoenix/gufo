@@ -93,6 +93,9 @@ public:
 
   struct RestoreResult {
     bool restored{false};
+    /// A model restore failed after it could have mutated state. The caller
+    /// must discard any existing lease's reuse metadata before continuing.
+    bool state_invalidated{false};
     std::size_t token_count{0};
     std::size_t file_bytes{0};
     std::size_t payload_bytes{0};
@@ -162,7 +165,8 @@ public:
   /// When min_prefix_tokens is nonzero, the restore only happens when the
   /// stored checkpoint extends past that count — a caller holding a shorter
   /// RAM-cache hit consults the disk tier without regressing to it (#411).
-  /// Nothing is touched in the state when no restore happens.
+  /// An unsuccessful result leaves state unchanged unless state_invalidated
+  /// is true.
   [[nodiscard]] RestoreResult RestoreLongestPrefix(
       const TextModelRunner& runner, TextRunnerState& state,
       std::span<const TextRunnerToken> prompt,
