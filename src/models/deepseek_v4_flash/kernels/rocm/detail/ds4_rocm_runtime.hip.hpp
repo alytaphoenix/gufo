@@ -868,9 +868,6 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
     const uint64_t huge_kv = 8ull * 1073741824ull;
     if (kv_cache_bytes >= huge_kv) return 1;
 
-    const uint64_t large_context = 8ull * 1073741824ull;
-    if (context_bytes < large_context) return 0;
-
     size_t free_b = 0;
     size_t total_b = 0;
     hipError_t err = hipMemGetInfo(&free_b, &total_b);
@@ -879,11 +876,17 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
         return 0;
     }
 
+    /* Ask the driver rather than guessing from the context size.  On unified
+     * memory the weights can consume the device pool before the session is
+     * built (their own spans fall back to managed one at a time), leaving
+     * nothing for these tensors -- so a small context still needs managed
+     * memory when the pool is already gone. */
     const uint64_t free_bytes = (uint64_t)free_b;
     const uint64_t total_bytes = (uint64_t)total_b;
     const uint64_t reserve_bytes = hip_managed_kv_reserve_bytes(total_bytes);
-    if (context_bytes > free_bytes) return 1;
-    return free_bytes - context_bytes < reserve_bytes;
+    if (kv_cache_bytes > free_bytes) return 1;
+    if (free_bytes - kv_cache_bytes < reserve_bytes) return 1;
+    return context_bytes > free_bytes;
 }
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
