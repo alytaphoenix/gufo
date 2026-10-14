@@ -667,6 +667,22 @@ static char* hip_model_range_alloc(uint64_t bytes, const char* what) {
   void* dev = NULL;
   hipError_t err = hipMalloc(&dev, (size_t)bytes);
   if (err != hipSuccess) {
+    /* On a unified-memory machine the driver's device pool is a fraction of
+     * system RAM (about half on gfx1151), so a checkpoint whose weights
+     * exceed it cannot be allocated device-only even though the system has
+     * the memory free.  Managed memory is ordinary system memory the GPU can
+     * also access, and is not bounded by that pool -- the same escape hatch
+     * used for the KV cache above and for Qwen weights elsewhere.  Only give
+     * up when both fail. */
+    fprintf(stderr,
+            DS4_GPU_LOG_PREFIX
+            "device pool exhausted for %s (%.2f MiB), retrying as managed: %s\n",
+            what ? what : "weights", (double)bytes / 1048576.0,
+            hipGetErrorString(err));
+    (void)hipGetLastError();
+    err = hipMallocManaged(&dev, (size_t)bytes);
+  }
+  if (err != hipSuccess) {
     fprintf(stderr,
             DS4_GPU_LOG_PREFIX
             "model span alloc failed for %s (%.2f MiB): %s\n",
