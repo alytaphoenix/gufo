@@ -1484,7 +1484,7 @@ int RunServe(std::span<const char* const> args) {
                        },
                        vision_model_path,
                        server::TextRunnerRamCacheOptions{
-                           .capacity_bytes = cache_ram_bytes}));
+                           .capacity_bytes = cache_ram_bytes});
     early_health_running.store(false, std::memory_order_release);
     early_health_thread.join();
     if (!load_ok) {
