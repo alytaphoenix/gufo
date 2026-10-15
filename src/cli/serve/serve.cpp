@@ -1,5 +1,9 @@
 #include "src/cli/serve/serve.hpp"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -8,7 +12,6 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
-#include <poll.h>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
