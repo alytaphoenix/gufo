@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <poll.h>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -1399,7 +1400,56 @@ int RunServe(std::span<const char* const> args) {
     std::string err;
     ModelLoadLog load_log("text", model);
     backend = std::make_shared<server::InferenceBackend>();
-    if (!backend->load(model, &err, max_context, session_count,
+    // Keep a tiny /health responder alive while the full model and disk
+    // snapshot tier load. External supervisors (llama-swap's health check)
+    // can connect to this instead of seeing a connection refused / dead
+    // process while the slow indexing work runs. The full HTTP server starts
+    // only after the model is loaded.
+    std::atomic<bool> early_health_running{true};
+    std::thread early_health_thread([&]() {
+      ::signal(SIGPIPE, SIG_IGN);
+      int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+      if (listen_fd < 0)
+        return;
+      int yes = 1;
+      ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+      sockaddr_in addr{};
+      addr.sin_family = AF_INET;
+      if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1 ||
+          port < 0 || port > 65535) {
+        ::close(listen_fd);
+        return;
+      }
+      addr.sin_port = htons(static_cast<unsigned short>(port));
+      if (::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) <
+              0 ||
+          ::listen(listen_fd, 16) < 0) {
+        ::close(listen_fd);
+        return;
+      }
+      while (early_health_running.load(std::memory_order_acquire)) {
+        pollfd descriptor{.fd = listen_fd, .events = POLLIN, .revents = 0};
+        if (::poll(&descriptor, 1, 100) <= 0)
+          continue;
+        int client_fd = ::accept(listen_fd, nullptr, nullptr);
+        if (client_fd < 0)
+          continue;
+        char buffer[1024];
+        (void)::recv(client_fd, buffer, sizeof(buffer), 0);
+        const char* response =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 15\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "{\"status\":\"ok\"}";
+        (void)::send(client_fd, response, std::char_traits<char>::length(response),
+                     0);
+        ::close(client_fd);
+      }
+      ::close(listen_fd);
+    });
+    const bool load_ok = backend->load(model, &err, max_context, session_count,
                        server::TextPrefillPolicy{
                            .decode_active_tokens = prefill_chunk_tokens,
                        },
@@ -1431,7 +1481,10 @@ int RunServe(std::span<const char* const> args) {
                        },
                        vision_model_path,
                        server::TextRunnerRamCacheOptions{
-                           .capacity_bytes = cache_ram_bytes})) {
+                           .capacity_bytes = cache_ram_bytes}));
+    early_health_running.store(false, std::memory_order_release);
+    early_health_thread.join();
+    if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }
