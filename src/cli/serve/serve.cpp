@@ -1410,6 +1410,7 @@ int RunServe(std::span<const char* const> args) {
     // only after the model is loaded.
     std::atomic<bool> early_health_running{true};
     std::thread early_health_thread([&]() {
+      // A supervisor that gives up mid-write must not take the process down.
       ::signal(SIGPIPE, SIG_IGN);
       int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
       if (listen_fd < 0)
@@ -1437,17 +1438,28 @@ int RunServe(std::span<const char* const> args) {
         int client_fd = ::accept(listen_fd, nullptr, nullptr);
         if (client_fd < 0)
           continue;
-        char buffer[1024];
-        (void)::recv(client_fd, buffer, sizeof(buffer), 0);
-        const char* response =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: 15\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "{\"status\":\"ok\"}";
-        (void)::send(client_fd, response, std::char_traits<char>::length(response),
-                     0);
+        char buffer[2048];
+        const ssize_t received = ::recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+        if (received > 0)
+          buffer[received] = '\0';
+        const std::string request(buffer, received > 0 ? received : 0);
+        // Answer the health endpoints and nothing else. A responder that
+        // returned 200 for every path would tell a client the model is ready
+        // when it is still loading, and would hand an inference request a
+        // 200 with a body that is not a completion.
+        const bool health =
+            request.find(" /health ") != std::string::npos ||
+            request.find(" /v1/health ") != std::string::npos ||
+            request.find(" /healthz ") != std::string::npos;
+        const std::string body = health ? R"({"status":"ok"})"
+                                        : R"({"error":"model is still loading"})";
+        const std::string response =
+            (health ? "HTTP/1.1 200 OK\r\n"
+                    : "HTTP/1.1 503 Service Unavailable\r\n") +
+            "Content-Type: application/json\r\n" +
+            "Content-Length: " + std::to_string(body.size()) +
+            "\r\nConnection: close\r\n\r\n" + body;
+        (void)::send(client_fd, response.data(), response.size(), 0);
         ::close(client_fd);
       }
       ::close(listen_fd);
