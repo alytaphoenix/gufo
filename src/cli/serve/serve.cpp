@@ -1454,8 +1454,8 @@ int RunServe(std::span<const char* const> args) {
         const std::string body = health ? R"({"status":"ok"})"
                                         : R"({"error":"model is still loading"})";
         const std::string response =
-            (health ? "HTTP/1.1 200 OK\r\n"
-                    : "HTTP/1.1 503 Service Unavailable\r\n") +
+            (health ? std::string("HTTP/1.1 200 OK\r\n")
+                    : std::string("HTTP/1.1 503 Service Unavailable\r\n")) +
             "Content-Type: application/json\r\n" +
             "Content-Length: " + std::to_string(body.size()) +
             "\r\nConnection: close\r\n\r\n" + body;
