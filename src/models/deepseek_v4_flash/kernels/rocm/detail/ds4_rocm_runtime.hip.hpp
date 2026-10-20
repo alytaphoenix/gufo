@@ -1,8 +1,8 @@
 static const void *g_model_host_base;
 static uint64_t g_model_registered_size;
-/* Set when the weights cannot fit the device pool; they then go wholly to
- * managed memory so the pool is left intact for session state. */
-static int g_model_weights_managed;
+/* Placement for this model load, decided once from the registered weight size
+ * against the device heap; see gufo::hip::WeightAllocator. */
+static std::unique_ptr<gufo::hip::WeightAllocator> g_model_weight_alloc;
 static int g_model_fd = -1;
 static const void *g_model_fd_host_base;
 static int g_model_cache_full;
@@ -659,40 +659,38 @@ static void hip_model_staging_release(void) {
     g_model_uploader.reset();
 }
 
-/* On a unified-memory machine the driver's device pool is a fraction of system
+/* On a unified-memory machine the driver's device heap is a fraction of system
  * RAM (about 61 of 122 GiB on gfx1151), so a checkpoint whose weights exceed
  * it cannot be allocated device-only even though the system has the memory
  * free. Managed memory is ordinary system memory the GPU can also access, and
- * is not bounded by that pool -- the same escape hatch used for the KV cache
+ * is not bounded by that heap -- the same escape hatch used for the KV cache
  * below and for Qwen weights elsewhere.
  *
- * Decide once from the registered weight size against the pool, rather than
+ * Decide once from the registered weight size against the heap, rather than
  * discovering the limit one failed span at a time: a per-span fallback drains
- * the pool to its last byte and leaves nothing for the session's
- * device-only scratch tensors, which then fail with
+ * the heap to its last byte and leaves nothing for the session's device-only
+ * scratch tensors, which then fail with
  * "tensor alloc failed: out of memory". Oversized weights therefore go wholly
- * to managed memory, leaving the pool for session state, which is what the
- * pool is for. */
-static void hip_model_choose_managed_weights(void) {
-  if (g_model_weights_managed)
-    return;
-  size_t free_b = 0;
-  size_t total_b = 0;
-  if (hipMemGetInfo(&free_b, &total_b) != hipSuccess) {
-    (void)hipGetLastError();
-    return;
+ * to managed memory, leaving the heap for session state, which is what the
+ * heap is for.
+ *
+ * gufo::hip::WeightAllocator makes the decision and allocates coarse-grain
+ * managed memory, so the GPU caches weight pages the way it caches hipMalloc
+ * memory. */
+static gufo::hip::WeightAllocator *hip_model_weight_allocator(void) {
+  if (!g_model_weight_alloc) {
+    g_model_weight_alloc = std::make_unique<gufo::hip::WeightAllocator>(
+        g_model_registered_size);
+    if (g_model_weight_alloc->placement() == gufo::hip::Placement::kManaged) {
+      fprintf(stderr,
+              DS4_GPU_LOG_PREFIX
+              "weights (%.2f GiB) do not fit the device heap above its "
+              "%.2f GiB dispatch reserve; placing them in managed memory\n",
+              (double)g_model_registered_size / 1073741824.0,
+              (double)gufo::hip::kDispatchReserve / 1073741824.0);
+    }
   }
-  /* Leave a quarter of the pool for session state and scratch. */
-  const uint64_t usable = (uint64_t)free_b - (uint64_t)total_b / 4u;
-  if (g_model_registered_size > usable) {
-    g_model_weights_managed = 1;
-    fprintf(stderr,
-            DS4_GPU_LOG_PREFIX
-            "weights (%.2f GiB) exceed the usable device pool (%.2f GiB); "
-            "placing them in managed memory\n",
-            (double)g_model_registered_size / 1073741824.0,
-            (double)usable / 1073741824.0);
-  }
+  return g_model_weight_alloc.get();
 }
 
 static char* hip_model_range_alloc(uint64_t bytes, const char* what) {
@@ -703,11 +701,8 @@ static char* hip_model_range_alloc(uint64_t bytes, const char* what) {
   // The loader already merges adjacent tensors into large upload spans.
   // Allocate each span exactly: packing them into larger fixed blocks leaves
   // several GiB unused, reducing memory available to concurrent sessions.
-  hip_model_choose_managed_weights();
   void* dev = NULL;
-  hipError_t err = g_model_weights_managed
-                       ? hipMallocManaged(&dev, (size_t)bytes)
-                       : hipMalloc(&dev, (size_t)bytes);
+  hipError_t err = hip_model_weight_allocator()->Allocate(&dev, (size_t)bytes);
   if (err != hipSuccess) {
     fprintf(stderr,
             DS4_GPU_LOG_PREFIX
@@ -765,6 +760,7 @@ static void hip_model_range_release_all(void) {
   g_model_ranges.clear();
   g_model_range_by_offset.clear();
   g_model_range_bytes = 0;
+  g_model_weight_alloc.reset();
   hip_model_load_progress_reset();
 }
 
@@ -844,6 +840,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     hip_model_staging_release();
     g_model_host_base = NULL;
     g_model_registered_size = 0;
+    g_model_weight_alloc.reset();
     g_model_fd = -1;
     g_model_cache_full = 0;
 }
